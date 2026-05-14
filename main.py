@@ -17,6 +17,7 @@ Zmienne środowiskowe (plik .env lub export):
   VOLUME               - głośność 0.0–1.0 (domyślnie: 0.5)
 """
 
+import asyncio
 import logging
 import os
 import random
@@ -59,13 +60,18 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 # Stan per-serwer
 # ---------------------------------------------------------------------------
 
-# guild_id -> {"sound": str | None, "channels": set[str]}
+# guild_id -> {"sound": str | None, "channels": set[str], "queue": Queue, "worker": Task | None}
 _guild_state: dict[int, dict] = {}
 
 
 def _state(guild_id: int) -> dict:
     if guild_id not in _guild_state:
-        _guild_state[guild_id] = {"sound": None, "channels": set()}
+        _guild_state[guild_id] = {
+            "sound": None,
+            "channels": set(),
+            "queue": asyncio.Queue(),
+            "worker": None,
+        }
     return _guild_state[guild_id]
 
 
@@ -147,7 +153,25 @@ async def on_voice_state_update(
         log.warning("Brak plików dźwiękowych w '%s'.", SOUNDS_DIR)
         return
 
-    await _play_sound(member.guild, after.channel, sound_path)
+    state = _state(member.guild.id)
+    await state["queue"].put((after.channel, sound_path))
+    log.info("Queued '%s' for %s (queue size: %d)", sound_path.stem, member.display_name, state["queue"].qsize())
+
+    if state["worker"] is None or state["worker"].done():
+        state["worker"] = asyncio.create_task(_queue_worker(member.guild.id))
+
+
+async def _queue_worker(guild_id: int) -> None:
+    state = _state(guild_id)
+    q: asyncio.Queue = state["queue"]
+    while not q.empty():
+        channel, sound_path = await q.get()
+        try:
+            await _play_sound(channel.guild, channel, sound_path)
+        except Exception as e:
+            log.exception("Worker error: %s", e)
+        finally:
+            q.task_done()
 
 
 async def _play_sound(
@@ -155,7 +179,7 @@ async def _play_sound(
     channel: discord.VoiceChannel,
     sound_path: Path,
 ) -> None:
-    """Łączy się z kanałem (lub przenosi) i odtwarza dźwięk."""
+    """Connects to channel, plays sound, waits for finish, then disconnects."""
     try:
         vc = guild.voice_client
 
@@ -173,12 +197,18 @@ async def _play_sound(
             volume=VOLUME,
         )
 
+        done: asyncio.Future = bot.loop.create_future()
+
         def _after(error: Exception | None) -> None:
             if error:
                 log.error("Błąd odtwarzania: %s", error)
+            bot.loop.call_soon_threadsafe(done.set_result, None)
 
         vc.play(source, after=_after)
         log.info("▶ Gram '%s' na #%s dla %s", sound_path.stem, channel.name, channel.guild.name)
+
+        await done
+        await vc.disconnect()
 
     except discord.ClientException as e:
         log.error("Błąd klienta Discord: %s", e)
